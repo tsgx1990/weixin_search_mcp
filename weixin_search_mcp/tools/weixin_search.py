@@ -1,5 +1,6 @@
 import json
 import asyncio
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Optional
@@ -17,8 +18,8 @@ BASE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
 }
 
-# 翻页请求间隔（秒）：避免连续翻页触发搜狗反爬限流
-PAGE_INTERVAL_SECONDS = 3
+# 翻页请求间隔（秒）范围：随机化以避免固定节奏触发搜狗反爬限流
+PAGE_INTERVAL_RANGE = (1, 3)
 
 
 def _is_antispider_response(response: requests.Response) -> bool:
@@ -139,7 +140,7 @@ def sogou_weixin_search_all(query: str, max_pages: int = 10) -> List[Dict[str, s
         all_results.extend(results)
         # 避免请求过快被限流
         if page < max_pages:
-            time.sleep(PAGE_INTERVAL_SECONDS)
+            time.sleep(random.uniform(*PAGE_INTERVAL_RANGE))
 
     return all_results
 
