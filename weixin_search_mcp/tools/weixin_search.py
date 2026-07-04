@@ -17,6 +17,9 @@ BASE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
 }
 
+# 翻页请求间隔（秒）：避免连续翻页触发搜狗反爬限流
+PAGE_INTERVAL_SECONDS = 3
+
 
 def _is_antispider_response(response: requests.Response) -> bool:
     """Detect Sogou anti-spider pages that otherwise look like empty results."""
@@ -136,7 +139,7 @@ def sogou_weixin_search_all(query: str, max_pages: int = 10) -> List[Dict[str, s
         all_results.extend(results)
         # 避免请求过快被限流
         if page < max_pages:
-            time.sleep(1)
+            time.sleep(PAGE_INTERVAL_SECONDS)
 
     return all_results
 
