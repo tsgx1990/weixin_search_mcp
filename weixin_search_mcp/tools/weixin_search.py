@@ -11,6 +11,12 @@ import time
 REQUEST_TIMEOUT = 15
 CN_TZ = timezone(timedelta(hours=8))
 
+# Sogou 反爬对请求头很敏感：Accept-Language / Cache-Control / Pragma 等
+# "看起来更像浏览器"的头反而会触发 /antispider/ 跳转，只保留 User-Agent 最稳。
+BASE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+}
+
 
 def _is_antispider_response(response: requests.Response) -> bool:
     """Detect Sogou anti-spider pages that otherwise look like empty results."""
@@ -44,15 +50,6 @@ def sogou_weixin_search(
         page: 页码，默认1
     """
     session = requests.Session()
-    headers = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Pragma': 'no-cache',
-        'Referer': f'https://weixin.sogou.com/weixin?query={quote(query)}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0',
-    }
 
     params = {
         'type': '2',
@@ -68,7 +65,7 @@ def sogou_weixin_search(
         response = session.get(
             'https://weixin.sogou.com/weixin',
             params=params,
-            headers=headers,
+            headers=BASE_HEADERS,
             timeout=REQUEST_TIMEOUT,
         )
 
@@ -95,11 +92,11 @@ def sogou_weixin_search(
             if link and not link.startswith('http'):
                 link = 'https://weixin.sogou.com' + link
 
-            # 获取真实URL：复用本次搜索建立的会话 cookie + 真实 Referer，
+            # 获取真实URL：复用本次搜索建立的会话 cookie，
             # 否则一个"裸"请求会被搜狗反爬直接 302 到 antispider 验证页
             real_url = ""
             try:
-                real_url = get_real_url_from_sogou(link, session=session, referer=response.url)
+                real_url = get_real_url_from_sogou(link, session=session)
             except Exception:
                 pass
 
@@ -147,49 +144,26 @@ def sogou_weixin_search_all(query: str, max_pages: int = 10) -> List[Dict[str, s
 def get_real_url_from_sogou(
     sogou_url: str,
     session: Optional[requests.Session] = None,
-    referer: Optional[str] = None,
 ) -> str:
     """从搜狗微信链接获取真实的微信公众号文章链接
 
-    优先复用调用方传入的 session（承载着搜索请求建立的 cookie）并带上
-    真实的搜索结果页 Referer；一个脱离搜索会话的裸请求会被搜狗反爬
-    直接 302 到 antispider 验证页，导致 real_url 恒为空。
+    优先复用调用方传入的 session（承载着搜索请求建立的 cookie）；
+    一个脱离搜索会话的裸请求会被搜狗反爬直接 302 到 antispider 验证页，
+    导致 real_url 恒为空。
     """
-    headers = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Pragma': 'no-cache',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0',
-    }
-    if referer:
-        headers['Referer'] = referer
-
     requester = session if session is not None else requests
 
     try:
-        response = requester.get(sogou_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requester.get(sogou_url, headers=BASE_HEADERS, timeout=REQUEST_TIMEOUT)
 
         if _is_antispider_response(response):
             return ""
 
-        script_content = response.text
-        start_index = script_content.find("url += '") + len("url += '")
-        url_parts = []
-        while True:
-            part_start = script_content.find("url += '", start_index)
-            if part_start == -1:
-                break
-            part_end = script_content.find("'", part_start + len("url += '"))
-            part = script_content[part_start + len("url += '"):part_end]
-            url_parts.append(part)
-            start_index = part_end + 1
-
+        # 用正则一次性抓全部 url += '...' 分片；旧版手写的 find() 循环会把
+        # 第一个分片（正好是 "https://mp."）跳过，导致拼出来的链接丢了协议头
+        url_parts = re.findall(r"url \+= '([^']*)'", response.text)
         full_url = ''.join(url_parts).replace("@", "")
-        if not full_url:
-            return ""
-        return "https://mp." + full_url
+        return full_url
     except Exception:
         return ""
 
@@ -200,33 +174,13 @@ def get_real_url(sogou_url: Annotated[str, "搜狗微信链接,来自于sogou_we
     return get_real_url_from_sogou(sogou_url)
 
 
-def get_article_content(real_url: Annotated[str, "真实微信公众号文章链接"], referer: Annotated[Optional[str], "请求来源,get_real_url的返回值"]) -> str:
+def get_article_content(real_url: Annotated[str, "真实微信公众号文章链接"], referer: Annotated[Optional[str], "请求来源,get_real_url的返回值"] = None) -> str:
     """获取微信公众号文章的正文内容"""
-    headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-        'cache-control': 'no-cache',
-        'pragma': 'no-cache',
-        'priority': 'u=0, i',
-        'referer': referer,
-        'sec-ch-ua': '"Microsoft Edge";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'cross-site',
-        'sec-fetch-user': '?1',
-        'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0',
-    }
-    if not referer:
-        headers.pop('referer')
-
     try:
-        if not real_url or real_url == "https://mp.":
+        if not real_url or real_url == "https://mp." or not real_url.startswith("http"):
             return "获取文章内容失败: 未拿到有效的微信公众号文章链接"
 
-        response = requests.get(real_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requests.get(real_url, headers=BASE_HEADERS, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         tree = html.fromstring(response.text)
         content_elements = tree.xpath("//div[@id='js_content']//text()")
@@ -249,8 +203,7 @@ def get_wechat_article(query: str, number=10):
     for every_result in results:
         sougou_link = every_result["link"]
         real_url = every_result["real_url"] or get_real_url(sougou_link)
-        # referer：请求来源
-        content = get_article_content(real_url, referer=sougou_link)
+        content = get_article_content(real_url)
         article = {
             "title": every_result["title"],
             "publish_time": every_result["publish_time"],
