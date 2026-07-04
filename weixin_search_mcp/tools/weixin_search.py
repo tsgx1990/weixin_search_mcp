@@ -1,5 +1,7 @@
 import json
 import asyncio
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Optional
 import requests
 from lxml import html
@@ -7,6 +9,7 @@ from urllib.parse import quote
 import time
 
 REQUEST_TIMEOUT = 15
+CN_TZ = timezone(timedelta(hours=8))
 
 
 def _is_antispider_response(response: requests.Response) -> bool:
@@ -14,6 +17,19 @@ def _is_antispider_response(response: requests.Response) -> bool:
     final_url = response.url.lower()
     body = response.text.lower()
     return "antispider" in final_url or "seccoderight" in body or "anti.min.css" in body
+
+
+def _parse_publish_time(raw: str) -> str:
+    """Sogou 用 document.write(timeConvert('<epoch>')) 延迟渲染发布时间，
+    静态抓取拿到的是这段未执行的 JS 源码而不是时间文本；这里把内嵌的
+    Unix 时间戳解析出来转成可读时间，解析不出来时原样返回。"""
+    match = re.search(r"timeConvert\('(\d+)'\)", raw)
+    if not match:
+        return raw
+    try:
+        return datetime.fromtimestamp(int(match.group(1)), tz=CN_TZ).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError):
+        return raw
 
 
 def sogou_weixin_search(
@@ -27,6 +43,7 @@ def sogou_weixin_search(
         query: 搜索关键词
         page: 页码，默认1
     """
+    session = requests.Session()
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
@@ -48,7 +65,7 @@ def sogou_weixin_search(
     }
 
     try:
-        response = requests.get(
+        response = session.get(
             'https://weixin.sogou.com/weixin',
             params=params,
             headers=headers,
@@ -78,10 +95,11 @@ def sogou_weixin_search(
             if link and not link.startswith('http'):
                 link = 'https://weixin.sogou.com' + link
 
-            # 获取真实URL
+            # 获取真实URL：复用本次搜索建立的会话 cookie + 真实 Referer，
+            # 否则一个"裸"请求会被搜狗反爬直接 302 到 antispider 验证页
             real_url = ""
             try:
-                real_url = get_real_url_from_sogou(link)
+                real_url = get_real_url_from_sogou(link, session=session, referer=response.url)
             except Exception:
                 pass
 
@@ -89,7 +107,7 @@ def sogou_weixin_search(
                 'title': title,
                 'link': link,
                 'real_url': real_url,
-                'publish_time': time_elem.text_content().strip(),
+                'publish_time': _parse_publish_time(time_elem.text_content().strip()),
                 'page': str(page)  # str to match Dict[str, str] type signature
             })
 
@@ -126,8 +144,17 @@ def sogou_weixin_search_all(query: str, max_pages: int = 10) -> List[Dict[str, s
     return all_results
 
 
-def get_real_url_from_sogou(sogou_url: str) -> str:
-    """从搜狗微信链接获取真实的微信公众号文章链接"""
+def get_real_url_from_sogou(
+    sogou_url: str,
+    session: Optional[requests.Session] = None,
+    referer: Optional[str] = None,
+) -> str:
+    """从搜狗微信链接获取真实的微信公众号文章链接
+
+    优先复用调用方传入的 session（承载着搜索请求建立的 cookie）并带上
+    真实的搜索结果页 Referer；一个脱离搜索会话的裸请求会被搜狗反爬
+    直接 302 到 antispider 验证页，导致 real_url 恒为空。
+    """
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
@@ -135,11 +162,14 @@ def get_real_url_from_sogou(sogou_url: str) -> str:
         'Connection': 'keep-alive',
         'Pragma': 'no-cache',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0',
-        'Cookie': 'ABTEST=7|1750756616|v1; SUID=0A5BF4788E52A20B00000000685A6D08; IPLOC=CN1100; SUID=605BF4783954A20B00000000685A6D08; SUV=006817F578F45BFE685A6D0B913DA642; SNUID=B3E34CC0B8BF80F5737E3561B9B78454; ariaDefaultTheme=undefined',
     }
+    if referer:
+        headers['Referer'] = referer
+
+    requester = session if session is not None else requests
 
     try:
-        response = requests.get(sogou_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = requester.get(sogou_url, headers=headers, timeout=REQUEST_TIMEOUT)
 
         if _is_antispider_response(response):
             return ""
@@ -160,12 +190,13 @@ def get_real_url_from_sogou(sogou_url: str) -> str:
         if not full_url:
             return ""
         return "https://mp." + full_url
-    except Exception as e:
+    except Exception:
         return ""
 
 
 def get_real_url(sogou_url: Annotated[str, "搜狗微信链接,来自于sogou_weixin_search工具结果"]) -> str:
-    """从搜狗微信链接获取真实的微信公众号文章链接"""
+    """从搜狗微信链接获取真实的微信公众号文章链接（独立调用，无搜索会话可复用，
+    命中反爬的概率比 sogou_weixin_search 内部调用更高）"""
     return get_real_url_from_sogou(sogou_url)
 
 
@@ -217,7 +248,7 @@ def get_wechat_article(query: str, number=10):
     results = results[:number]
     for every_result in results:
         sougou_link = every_result["link"]
-        real_url = get_real_url(sougou_link)
+        real_url = every_result["real_url"] or get_real_url(sougou_link)
         # referer：请求来源
         content = get_article_content(real_url, referer=sougou_link)
         article = {
